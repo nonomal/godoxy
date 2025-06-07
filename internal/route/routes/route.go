@@ -23,11 +23,13 @@ type (
 		task.TaskFinisher
 		pool.Object
 		ProviderName() string
+		GetProvider() Provider
 		TargetURL() *net.URL
 		HealthMonitor() health.HealthMonitor
+		SetHealthMonitor(m health.HealthMonitor)
 		References() []string
 
-		Started() bool
+		Started() <-chan struct{}
 
 		IdlewatcherConfig() *idlewatcher.Config
 		HealthCheckConfig() *health.HealthCheckConfig
@@ -56,5 +58,11 @@ type (
 	StreamRoute interface {
 		Route
 		net.Stream
+	}
+	Provider interface {
+		GetRoute(alias string) (r Route, ok bool)
+		IterRoutes(yield func(alias string, r Route) bool)
+		FindService(project, service string) (r Route, ok bool)
+		ShortName() string
 	}
 )

@@ -11,19 +11,13 @@ import (
 	net "github.com/yusing/go-proxy/internal/net/types"
 	"github.com/yusing/go-proxy/internal/route/routes"
 	"github.com/yusing/go-proxy/internal/task"
-	"github.com/yusing/go-proxy/internal/watcher/health"
 	"github.com/yusing/go-proxy/internal/watcher/health/monitor"
 )
 
 // TODO: support stream load balance.
 type StreamRoute struct {
 	*Route
-
 	net.Stream `json:"-"`
-
-	HealthMon health.HealthMonitor `json:"health"`
-
-	task *task.Task
 
 	l zerolog.Logger
 }
@@ -41,15 +35,12 @@ func NewStreamRoute(base *Route) (routes.Route, gperr.Error) {
 
 // Start implements task.TaskStarter.
 func (r *StreamRoute) Start(parent task.Parent) gperr.Error {
-	if existing, ok := routes.Stream.Get(r.Key()); ok {
-		return gperr.Errorf("route already exists: from provider %s and %s", existing.ProviderName(), r.ProviderName())
-	}
-	r.task = parent.Subtask("stream."+r.Name(), true)
+	r.task = parent.Subtask("stream."+r.Name(), !r.ShouldExclude())
 	r.Stream = NewStream(r)
 
 	switch {
 	case r.UseIdleWatcher():
-		waker, err := idlewatcher.NewWatcher(parent, r)
+		waker, err := idlewatcher.NewWatcher(parent, r, r.IdlewatcherConfig())
 		if err != nil {
 			r.task.Finish(err)
 			return gperr.Wrap(err, "idlewatcher error")
@@ -60,12 +51,13 @@ func (r *StreamRoute) Start(parent task.Parent) gperr.Error {
 		r.HealthMon = monitor.NewMonitor(r)
 	}
 
-	if err := r.Setup(); err != nil {
-		r.task.Finish(err)
-		return gperr.Wrap(err)
+	if !r.ShouldExclude() {
+		if err := r.Setup(); err != nil {
+			r.task.Finish(err)
+			return gperr.Wrap(err)
+		}
+		r.l.Info().Int("port", r.Port.Listening).Msg("listening")
 	}
-
-	r.l.Info().Int("port", r.Port.Listening).Msg("listening")
 
 	if r.HealthMon != nil {
 		if err := r.HealthMon.Start(r.task); err != nil {
@@ -73,27 +65,21 @@ func (r *StreamRoute) Start(parent task.Parent) gperr.Error {
 		}
 	}
 
+	if r.ShouldExclude() {
+		return nil
+	}
+
+	if err := checkExists(r); err != nil {
+		return err
+	}
+
 	go r.acceptConnections()
 
 	routes.Stream.Add(r)
-	r.task.OnFinished("entrypoint_remove_route", func() {
+	r.task.OnCancel("remove_route_from_stream", func() {
 		routes.Stream.Del(r)
 	})
 	return nil
-}
-
-// Task implements task.TaskStarter.
-func (r *StreamRoute) Task() *task.Task {
-	return r.task
-}
-
-// Finish implements task.TaskFinisher.
-func (r *StreamRoute) Finish(reason any) {
-	r.task.Finish(reason)
-}
-
-func (r *StreamRoute) HealthMonitor() health.HealthMonitor {
-	return r.HealthMon
 }
 
 func (r *StreamRoute) acceptConnections() {

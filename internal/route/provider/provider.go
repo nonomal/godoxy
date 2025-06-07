@@ -3,14 +3,17 @@ package provider
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"path"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/yusing/go-proxy/agent/pkg/agent"
 	"github.com/yusing/go-proxy/internal/gperr"
 	"github.com/yusing/go-proxy/internal/route"
-	"github.com/yusing/go-proxy/internal/route/provider/types"
+	provider "github.com/yusing/go-proxy/internal/route/provider/types"
+	"github.com/yusing/go-proxy/internal/route/routes"
 	"github.com/yusing/go-proxy/internal/task"
 	W "github.com/yusing/go-proxy/internal/watcher"
 	"github.com/yusing/go-proxy/internal/watcher/events"
@@ -20,8 +23,9 @@ type (
 	Provider struct {
 		ProviderImpl
 
-		t      types.ProviderType
-		routes route.Routes
+		t        provider.Type
+		routes   route.Routes
+		routesMu sync.RWMutex
 
 		watcher W.Watcher
 	}
@@ -41,7 +45,9 @@ const (
 
 var ErrEmptyProviderName = errors.New("empty provider name")
 
-func newProvider(t types.ProviderType) *Provider {
+var _ routes.Provider = (*Provider)(nil)
+
+func newProvider(t provider.Type) *Provider {
 	return &Provider{t: t}
 }
 
@@ -50,7 +56,7 @@ func NewFileProvider(filename string) (p *Provider, err error) {
 	if name == "" {
 		return nil, ErrEmptyProviderName
 	}
-	p = newProvider(types.ProviderTypeFile)
+	p = newProvider(provider.ProviderTypeFile)
 	p.ProviderImpl, err = FileProviderImpl(filename)
 	if err != nil {
 		return nil, err
@@ -60,14 +66,14 @@ func NewFileProvider(filename string) (p *Provider, err error) {
 }
 
 func NewDockerProvider(name string, dockerHost string) *Provider {
-	p := newProvider(types.ProviderTypeDocker)
+	p := newProvider(provider.ProviderTypeDocker)
 	p.ProviderImpl = DockerProviderImpl(name, dockerHost)
 	p.watcher = p.NewWatcher()
 	return p
 }
 
 func NewAgentProvider(cfg *agent.AgentConfig) *Provider {
-	p := newProvider(types.ProviderTypeAgent)
+	p := newProvider(provider.ProviderTypeAgent)
 	agent := &AgentProvider{
 		AgentConfig: cfg,
 		docker:      DockerProviderImpl(cfg.Name(), cfg.FakeDockerHost()),
@@ -77,7 +83,7 @@ func NewAgentProvider(cfg *agent.AgentConfig) *Provider {
 	return p
 }
 
-func (p *Provider) GetType() types.ProviderType {
+func (p *Provider) GetType() provider.Type {
 	return p.t
 }
 
@@ -86,25 +92,28 @@ func (p *Provider) MarshalText() ([]byte, error) {
 	return []byte(p.String()), nil
 }
 
-func (p *Provider) startRoute(parent task.Parent, r *route.Route) gperr.Error {
-	err := r.Start(parent)
-	if err != nil {
-		delete(p.routes, r.Alias)
-		return err.Subject(r.Alias)
-	}
-	p.routes[r.Alias] = r
-	return nil
-}
-
 // Start implements task.TaskStarter.
 func (p *Provider) Start(parent task.Parent) gperr.Error {
+	errs := gperr.NewBuilder("routes error")
+	errs.EnableConcurrency()
+
 	t := parent.Subtask("provider."+p.String(), false)
 
-	routesTask := t.Subtask("routes", false)
-	errs := gperr.NewBuilder("routes error")
+	// no need to lock here because we are not modifying the routes map.
+	routeSlice := make([]*route.Route, 0, len(p.routes))
 	for _, r := range p.routes {
-		errs.Add(p.startRoute(routesTask, r))
+		routeSlice = append(routeSlice, r)
 	}
+
+	var wg sync.WaitGroup
+	for _, r := range routeSlice {
+		wg.Add(1)
+		go func(r *route.Route) {
+			defer wg.Done()
+			errs.Add(p.startRoute(t, r))
+		}(r)
+	}
+	wg.Wait()
 
 	eventQueue := events.NewEventQueue(
 		t.Subtask("event_queue", false),
@@ -112,7 +121,7 @@ func (p *Provider) Start(parent task.Parent) gperr.Error {
 		func(events []events.Event) {
 			handler := p.newEventHandler()
 			// routes' lifetime should follow the provider's lifetime
-			handler.Handle(routesTask, events)
+			handler.Handle(t, events)
 			handler.Log()
 		},
 		func(err gperr.Error) {
@@ -127,15 +136,52 @@ func (p *Provider) Start(parent task.Parent) gperr.Error {
 	return nil
 }
 
-func (p *Provider) RangeRoutes(do func(string, *route.Route)) {
-	for alias, r := range p.routes {
-		do(alias, r)
+func (p *Provider) LoadRoutes() (err gperr.Error) {
+	p.routes, err = p.loadRoutes()
+	return
+}
+
+func (p *Provider) NumRoutes() int {
+	return len(p.routes)
+}
+
+func (p *Provider) IterRoutes(yield func(string, routes.Route) bool) {
+	routes := p.lockCloneRoutes()
+	for alias, r := range routes {
+		if !yield(alias, r.Impl()) {
+			break
+		}
 	}
 }
 
-func (p *Provider) GetRoute(alias string) (r *route.Route, ok bool) {
-	r, ok = p.routes[alias]
-	return
+func (p *Provider) FindService(project, service string) (routes.Route, bool) {
+	switch p.GetType() {
+	case provider.ProviderTypeDocker, provider.ProviderTypeAgent:
+	default:
+		return nil, false
+	}
+	if project == "" || service == "" {
+		return nil, false
+	}
+	routes := p.lockCloneRoutes()
+	for _, r := range routes {
+		cont := r.ContainerInfo()
+		if cont.DockerComposeProject() != project {
+			continue
+		}
+		if cont.DockerComposeService() == service {
+			return r.Impl(), true
+		}
+	}
+	return nil, false
+}
+
+func (p *Provider) GetRoute(alias string) (routes.Route, bool) {
+	r, ok := p.lockGetRoute(alias)
+	if !ok {
+		return nil, false
+	}
+	return r.Impl(), true
 }
 
 func (p *Provider) loadRoutes() (routes route.Routes, err gperr.Error) {
@@ -149,13 +195,9 @@ func (p *Provider) loadRoutes() (routes route.Routes, err gperr.Error) {
 	// set alias and provider, then validate
 	for alias, r := range routes {
 		r.Alias = alias
-		r.Provider = p.ShortName()
+		r.SetProvider(p)
 		if err := r.Validate(); err != nil {
 			errs.Add(err.Subject(alias))
-			delete(routes, alias)
-			continue
-		}
-		if r.ShouldExclude() {
 			delete(routes, alias)
 			continue
 		}
@@ -164,11 +206,40 @@ func (p *Provider) loadRoutes() (routes route.Routes, err gperr.Error) {
 	return routes, errs.Error()
 }
 
-func (p *Provider) LoadRoutes() (err gperr.Error) {
-	p.routes, err = p.loadRoutes()
-	return
+func (p *Provider) startRoute(parent task.Parent, r *route.Route) gperr.Error {
+	err := r.Start(parent)
+	if err != nil {
+		p.lockDeleteRoute(r.Alias)
+		return err.Subject(r.Alias)
+	}
+	p.lockAddRoute(r)
+	r.Task().OnCancel("remove_route_from_provider", func() {
+		p.lockDeleteRoute(r.Alias)
+	})
+	return nil
 }
 
-func (p *Provider) NumRoutes() int {
-	return len(p.routes)
+func (p *Provider) lockAddRoute(r *route.Route) {
+	p.routesMu.Lock()
+	defer p.routesMu.Unlock()
+	p.routes[r.Alias] = r
+}
+
+func (p *Provider) lockDeleteRoute(alias string) {
+	p.routesMu.Lock()
+	defer p.routesMu.Unlock()
+	delete(p.routes, alias)
+}
+
+func (p *Provider) lockGetRoute(alias string) (*route.Route, bool) {
+	p.routesMu.RLock()
+	defer p.routesMu.RUnlock()
+	r, ok := p.routes[alias]
+	return r, ok
+}
+
+func (p *Provider) lockCloneRoutes() route.Routes {
+	p.routesMu.RLock()
+	defer p.routesMu.RUnlock()
+	return maps.Clone(p.routes)
 }

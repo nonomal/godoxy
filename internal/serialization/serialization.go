@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"reflect"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -198,7 +197,7 @@ func mapUnmarshalValidate(src SerializedObject, dst any, checkValidateTag bool) 
 			dstV.Set(reflect.Zero(dstT))
 			return nil
 		}
-		return gperr.Errorf("deserialize: src is %w and dst is not settable\n%s", ErrNilValue, debug.Stack())
+		return gperr.Errorf("deserialize: src is %w and dst is not settable", ErrNilValue)
 	}
 
 	if dstT.Implements(mapUnmarshalerType) {
@@ -525,6 +524,17 @@ func UnmarshalValidateYAML[T any](data []byte, target *T) gperr.Error {
 	m := make(map[string]any)
 	if err := yaml.Unmarshal(data, &m); err != nil {
 		return gperr.Wrap(err)
+	}
+	return MapUnmarshalValidate(m, target)
+}
+
+func UnmarshalValidateYAMLIntercept[T any](data []byte, target *T, intercept func(m map[string]any) gperr.Error) gperr.Error {
+	m := make(map[string]any)
+	if err := yaml.Unmarshal(data, &m); err != nil {
+		return gperr.Wrap(err)
+	}
+	if err := intercept(m); err != nil {
+		return err
 	}
 	return MapUnmarshalValidate(m, target)
 }
