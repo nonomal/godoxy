@@ -1,8 +1,6 @@
 package idlewatcher
 
 import (
-	"context"
-	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -38,16 +36,20 @@ func (w *Watcher) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	default:
 		f := &ForceCacheControl{expires: w.expires().Format(http.TimeFormat), ResponseWriter: rw}
-		w, ok := watcherMap[w.Key()] // could've been reloaded
-		if !ok {
-			return
-		}
 		w.rp.ServeHTTP(f, r)
 	}
 }
 
 func isFaviconPath(path string) bool {
 	return path == "/favicon.ico"
+}
+
+func (w *Watcher) redirectToStartEndpoint(rw http.ResponseWriter, r *http.Request) {
+	uri := "/"
+	if w.cfg.StartEndpoint != "" {
+		uri = w.cfg.StartEndpoint
+	}
+	http.Redirect(rw, r, uri, http.StatusTemporaryRedirect)
 }
 
 func (w *Watcher) wakeFromHTTP(rw http.ResponseWriter, r *http.Request) (shouldNext bool) {
@@ -60,8 +62,7 @@ func (w *Watcher) wakeFromHTTP(rw http.ResponseWriter, r *http.Request) (shouldN
 
 	// handle favicon request
 	if isFaviconPath(r.URL.Path) {
-		r.URL.RawQuery = "alias=" + w.rp.TargetName
-		favicon.GetFavIcon(rw, r)
+		favicon.GetFavIconFromAlias(rw, r, w.route.Name())
 		return false
 	}
 
@@ -90,32 +91,32 @@ func (w *Watcher) wakeFromHTTP(rw http.ResponseWriter, r *http.Request) (shouldN
 		return false
 	}
 
-	ctx, cancel := context.WithTimeoutCause(r.Context(), w.cfg.WakeTimeout, errors.New("wake timeout"))
-	defer cancel()
-
-	if w.cancelled(ctx) {
-		gphttp.ServerError(rw, r, context.Cause(ctx), http.StatusServiceUnavailable)
+	ctx := r.Context()
+	if w.canceled(ctx) {
+		w.redirectToStartEndpoint(rw, r)
 		return false
 	}
 
 	w.l.Trace().Msg("signal received")
-	err := w.wakeIfStopped()
+	err := w.Wake(ctx)
 	if err != nil {
 		gphttp.ServerError(rw, r, err)
 		return false
 	}
 
-	var ready bool
-
 	for {
 		w.resetIdleTimer()
 
-		if w.cancelled(ctx) {
-			gphttp.ServerError(rw, r, context.Cause(ctx), http.StatusServiceUnavailable)
+		if w.canceled(ctx) {
+			w.redirectToStartEndpoint(rw, r)
 			return false
 		}
 
-		w, ready, err = checkUpdateState(w.Key())
+		if !w.waitStarted(ctx) {
+			return false
+		}
+
+		ready, err := w.checkUpdateState()
 		if err != nil {
 			gphttp.ServerError(rw, r, err)
 			return false

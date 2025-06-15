@@ -31,6 +31,8 @@ type (
 		checkHealth HealthCheckFunc
 		startTime   time.Time
 
+		isZeroPort bool
+
 		task *task.Task
 	}
 )
@@ -40,7 +42,7 @@ var ErrNegativeInterval = gperr.New("negative interval")
 func NewMonitor(r routes.Route) health.HealthMonCheck {
 	var mon health.HealthMonCheck
 	if r.IsAgent() {
-		mon = NewAgentProxiedMonitor(r.Agent(), r.HealthCheckConfig(), AgentTargetFromURL(&r.TargetURL().URL))
+		mon = NewAgentProxiedMonitor(r.GetAgent(), r.HealthCheckConfig(), AgentTargetFromURL(&r.TargetURL().URL))
 	} else {
 		switch r := r.(type) {
 		case routes.HTTPRoute:
@@ -63,28 +65,47 @@ func NewMonitor(r routes.Route) health.HealthMonCheck {
 	return mon
 }
 
-func newMonitor(url *url.URL, config *health.HealthCheckConfig, healthCheckFunc HealthCheckFunc) *monitor {
+func newMonitor(u *url.URL, config *health.HealthCheckConfig, healthCheckFunc HealthCheckFunc) *monitor {
 	mon := &monitor{
 		config:      config,
 		checkHealth: healthCheckFunc,
 		startTime:   time.Now(),
 	}
-	mon.url.Store(url)
+	if u == nil {
+		u = &url.URL{}
+	}
+	mon.url.Store(u)
 	mon.status.Store(health.StatusHealthy)
+
+	port := u.Port()
+	mon.isZeroPort = port == "" || port == "0"
+	if mon.isZeroPort {
+		mon.status.Store(health.StatusUnknown)
+		mon.lastResult.Store(&health.HealthCheckResult{Healthy: false, Detail: "no port detected"})
+	}
 	return mon
 }
 
 func (mon *monitor) ContextWithTimeout(cause string) (ctx context.Context, cancel context.CancelFunc) {
-	if mon.task != nil {
-		return context.WithTimeoutCause(mon.task.Context(), mon.config.Timeout, errors.New(cause))
+	switch {
+	case mon.config.BaseContext != nil:
+		ctx = mon.config.BaseContext()
+	case mon.task != nil:
+		ctx = mon.task.Context()
+	default:
+		ctx = context.Background()
 	}
-	return context.WithTimeoutCause(context.Background(), mon.config.Timeout, errors.New(cause))
+	return context.WithTimeoutCause(ctx, mon.config.Timeout, errors.New(cause))
 }
 
 // Start implements task.TaskStarter.
 func (mon *monitor) Start(parent task.Parent) gperr.Error {
 	if mon.config.Interval <= 0 {
 		return ErrNegativeInterval
+	}
+
+	if mon.isZeroPort {
+		return nil
 	}
 
 	mon.service = parent.Name()
