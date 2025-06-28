@@ -11,7 +11,6 @@ import (
 	"github.com/yusing/go-proxy/internal/net/gphttp/middleware"
 	"github.com/yusing/go-proxy/internal/route/routes"
 	"github.com/yusing/go-proxy/internal/task"
-	"github.com/yusing/go-proxy/internal/watcher/health"
 	"github.com/yusing/go-proxy/internal/watcher/health/monitor"
 )
 
@@ -19,9 +18,6 @@ type (
 	FileServer struct {
 		*Route
 
-		Health *monitor.FileServerHealthMonitor `json:"health"`
-
-		task         *task.Task
 		middleware   *middleware.Middleware
 		handler      http.Handler
 		accessLogger *accesslog.AccessLogger
@@ -90,26 +86,25 @@ func (s *FileServer) Start(parent task.Parent) gperr.Error {
 	}
 
 	if s.UseHealthCheck() {
-		s.Health = monitor.NewFileServerHealthMonitor(s.HealthCheck, s.Root)
-		if err := s.Health.Start(s.task); err != nil {
+		s.HealthMon = monitor.NewFileServerHealthMonitor(s.HealthCheck, s.Root)
+		if err := s.HealthMon.Start(s.task); err != nil {
 			return err
 		}
 	}
 
+	if s.ShouldExclude() {
+		return nil
+	}
+
+	if err := checkExists(s); err != nil {
+		return err
+	}
+
 	routes.HTTP.Add(s)
-	s.task.OnCancel("entrypoint_remove_route", func() {
+	s.task.OnFinished("remove_route_from_http", func() {
 		routes.HTTP.Del(s)
 	})
 	return nil
-}
-
-func (s *FileServer) Task() *task.Task {
-	return s.task
-}
-
-// Finish implements task.TaskFinisher.
-func (s *FileServer) Finish(reason any) {
-	s.task.Finish(reason)
 }
 
 // ServeHTTP implements http.Handler.
@@ -118,8 +113,4 @@ func (s *FileServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if s.accessLogger != nil {
 		s.accessLogger.Log(req, req.Response)
 	}
-}
-
-func (s *FileServer) HealthMonitor() health.HealthMonitor {
-	return s.Health
 }

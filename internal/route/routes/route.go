@@ -7,13 +7,13 @@ import (
 	"github.com/yusing/go-proxy/internal/docker"
 	"github.com/yusing/go-proxy/internal/homepage"
 	idlewatcher "github.com/yusing/go-proxy/internal/idlewatcher/types"
-	net "github.com/yusing/go-proxy/internal/net/types"
 	"github.com/yusing/go-proxy/internal/task"
 	"github.com/yusing/go-proxy/internal/utils/pool"
 	"github.com/yusing/go-proxy/internal/watcher/health"
 
 	loadbalance "github.com/yusing/go-proxy/internal/net/gphttp/loadbalancer/types"
 	"github.com/yusing/go-proxy/internal/net/gphttp/reverseproxy"
+	nettypes "github.com/yusing/go-proxy/internal/net/types"
 )
 
 type (
@@ -23,11 +23,13 @@ type (
 		task.TaskFinisher
 		pool.Object
 		ProviderName() string
-		TargetURL() *net.URL
+		GetProvider() Provider
+		TargetURL() *nettypes.URL
 		HealthMonitor() health.HealthMonitor
+		SetHealthMonitor(m health.HealthMonitor)
 		References() []string
 
-		Started() bool
+		Started() <-chan struct{}
 
 		IdlewatcherConfig() *idlewatcher.Config
 		HealthCheckConfig() *health.HealthCheckConfig
@@ -36,7 +38,7 @@ type (
 		HomepageItem() *homepage.Item
 		ContainerInfo() *docker.Container
 
-		Agent() *agent.AgentConfig
+		GetAgent() *agent.AgentConfig
 
 		IsDocker() bool
 		IsAgent() bool
@@ -55,6 +57,13 @@ type (
 	}
 	StreamRoute interface {
 		Route
-		net.Stream
+		nettypes.Stream
+		Stream() nettypes.Stream
+	}
+	Provider interface {
+		GetRoute(alias string) (r Route, ok bool)
+		IterRoutes(yield func(alias string, r Route) bool)
+		FindService(project, service string) (r Route, ok bool)
+		ShortName() string
 	}
 )
