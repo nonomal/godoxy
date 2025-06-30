@@ -3,13 +3,13 @@ package gpwebsocket
 import (
 	"net"
 	"net/http"
-	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
+	"github.com/yusing/go-proxy/agent/pkg/agent"
 )
 
 func warnNoMatchDomains() {
@@ -30,12 +30,17 @@ func SetWebsocketAllowedDomains(h http.Header, domains []string) {
 	h[HeaderXGoDoxyWebsocketAllowedDomains] = domains
 }
 
-var localAddresses = []string{"127.0.0.1", "10.0.*.*", "172.16.*.*", "192.168.*.*"}
-
 const writeTimeout = time.Second * 10
 
+// Initiate upgrades the HTTP connection to a WebSocket connection.
+// It returns a WebSocket connection and an error if the upgrade fails.
+// It logs and responds with an error if the upgrade fails.
+//
+// No further http.Error should be called after this function.
 func Initiate(w http.ResponseWriter, r *http.Request) (*websocket.Conn, error) {
-	upgrader := websocket.Upgrader{}
+	upgrader := websocket.Upgrader{
+		Error: errHandler,
+	}
 
 	allowedDomains := WebsocketAllowedDomains(r.Header)
 	if len(allowedDomains) == 0 {
@@ -49,8 +54,12 @@ func Initiate(w http.ResponseWriter, r *http.Request) (*websocket.Conn, error) {
 			if err != nil {
 				host = r.Host
 			}
-			if slices.Contains(localAddresses, host) {
+			if host == "localhost" || host == agent.AgentHost {
 				return true
+			}
+			ip := net.ParseIP(host)
+			if ip != nil {
+				return ip.IsLoopback() || ip.IsPrivate()
 			}
 			for _, domain := range allowedDomains {
 				if domain[0] == '.' {
@@ -70,7 +79,6 @@ func Initiate(w http.ResponseWriter, r *http.Request) (*websocket.Conn, error) {
 func Periodic(w http.ResponseWriter, r *http.Request, interval time.Duration, do func(conn *websocket.Conn) error) {
 	conn, err := Initiate(w, r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer conn.Close()
@@ -101,4 +109,16 @@ func Periodic(w http.ResponseWriter, r *http.Request, interval time.Duration, do
 func WriteText(conn *websocket.Conn, msg string) error {
 	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	return conn.WriteMessage(websocket.TextMessage, []byte(msg))
+}
+
+func errHandler(w http.ResponseWriter, r *http.Request, status int, reason error) {
+	log.Error().
+		Str("remote", r.RemoteAddr).
+		Str("host", r.Host).
+		Str("url", r.URL.String()).
+		Int("status", status).
+		AnErr("reason", reason).
+		Msg("websocket error")
+	w.Header().Set("Sec-Websocket-Version", "13")
+	http.Error(w, http.StatusText(status), status)
 }

@@ -71,7 +71,9 @@ func (p *DockerProvider) loadRoutesImpl() (route.Routes, gperr.Error) {
 
 	for _, c := range containers {
 		container := docker.FromDocker(&c, p.dockerHost)
-		if container.IsExcluded {
+
+		if container.Errors != nil {
+			errs.Add(container.Errors)
 			continue
 		}
 
@@ -89,10 +91,15 @@ func (p *DockerProvider) loadRoutesImpl() (route.Routes, gperr.Error) {
 		}
 		for k, v := range newEntries {
 			if conflict, ok := routes[k]; ok {
-				errs.Add(gperr.Multiline().
+				err := gperr.Multiline().
 					Addf("route with alias %s already exists", k).
 					Addf("container %s", container.ContainerName).
-					Addf("conflicting container %s", conflict.Container.ContainerName))
+					Addf("conflicting container %s", conflict.Container.ContainerName)
+				if conflict.ShouldExclude() || v.ShouldExclude() {
+					gperr.LogWarn("skipping conflicting route", err)
+				} else {
+					errs.Add(err)
+				}
 			} else {
 				routes[k] = v
 			}
@@ -122,10 +129,8 @@ func (p *DockerProvider) routesFromContainerLabels(container *docker.Container) 
 
 	errs := gperr.NewBuilder("label errors")
 
-	m, err := docker.ParseLabels(container.Labels)
+	m, err := docker.ParseLabels(container.Labels, container.Aliases...)
 	errs.Add(err)
-
-	var wildcardProps docker.LabelMap
 
 	for alias, entryMapAny := range m {
 		if len(alias) == 0 {
@@ -146,11 +151,6 @@ func (p *DockerProvider) routesFromContainerLabels(container *docker.Container) 
 				errs.Add(gperr.Wrap(err).Subject(alias))
 				continue
 			}
-		}
-
-		if alias == docker.WildcardAlias {
-			wildcardProps = entryMap
-			continue
 		}
 
 		// check if it is an alias reference
@@ -185,14 +185,6 @@ func (p *DockerProvider) routesFromContainerLabels(container *docker.Container) 
 			errs.Add(err.Subject(alias))
 		} else {
 			routes[alias] = r
-		}
-	}
-	if wildcardProps != nil {
-		for _, re := range routes {
-			if err := serialization.MapUnmarshalValidate(wildcardProps, re); err != nil {
-				errs.Add(err.Subject(docker.WildcardAlias))
-				break
-			}
 		}
 	}
 

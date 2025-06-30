@@ -3,7 +3,9 @@ package route
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -14,7 +16,7 @@ import (
 	"github.com/yusing/go-proxy/internal/homepage"
 	idlewatcher "github.com/yusing/go-proxy/internal/idlewatcher/types"
 	netutils "github.com/yusing/go-proxy/internal/net"
-	net "github.com/yusing/go-proxy/internal/net/types"
+	nettypes "github.com/yusing/go-proxy/internal/net/types"
 	"github.com/yusing/go-proxy/internal/proxmox"
 	"github.com/yusing/go-proxy/internal/task"
 	"github.com/yusing/go-proxy/internal/utils/strutils"
@@ -37,7 +39,7 @@ type (
 		Alias  string       `json:"alias"`
 		Scheme route.Scheme `json:"scheme,omitempty"`
 		Host   string       `json:"host,omitempty"`
-		Port   route.Port   `json:"port,omitempty"`
+		Port   route.Port   `json:"port"`
 		Root   string       `json:"root,omitempty"`
 
 		route.HTTPConfig
@@ -48,8 +50,10 @@ type (
 		Middlewares  map[string]docker.LabelMap     `json:"middlewares,omitempty"`
 		Homepage     *homepage.ItemConfig           `json:"homepage,omitempty"`
 		AccessLog    *accesslog.RequestLoggerConfig `json:"access_log,omitempty"`
+		Agent        string                         `json:"agent,omitempty"`
 
-		Idlewatcher *idlewatcher.Config `json:"idlewatcher,omitempty"`
+		Idlewatcher *idlewatcher.Config  `json:"idlewatcher,omitempty"`
+		HealthMon   health.HealthMonitor `json:"health,omitempty"`
 
 		Metadata `deserialize:"-"`
 	}
@@ -57,15 +61,26 @@ type (
 	Metadata struct {
 		/* Docker only */
 		Container *docker.Container `json:"container,omitempty"`
-		Provider  string            `json:"provider,omitempty"`
+
+		Provider string `json:"provider,omitempty"` // for backward compatibility
 
 		// private fields
-		LisURL   *net.URL `json:"lurl,omitempty"`
-		ProxyURL *net.URL `json:"purl,omitempty"`
+		LisURL   *nettypes.URL `json:"lurl,omitempty"`
+		ProxyURL *nettypes.URL `json:"purl,omitempty"`
 
-		impl        routes.Route
+		Excluded *bool `json:"excluded"`
+
+		impl routes.Route
+		task *task.Task
+
 		isValidated bool
 		lastError   gperr.Error
+		provider    routes.Provider
+
+		agent *agent.AgentConfig
+
+		started chan struct{}
+		once    sync.Once
 	}
 	Routes map[string]*Route
 )
@@ -82,7 +97,34 @@ func (r *Route) Validate() gperr.Error {
 		return r.lastError
 	}
 	r.isValidated = true
+
+	if r.Agent != "" {
+		if r.Container != nil {
+			return gperr.Errorf("specifying agent is not allowed for docker container routes")
+		}
+		var ok bool
+		// by agent address
+		r.agent, ok = agent.GetAgent(r.Agent)
+		if !ok {
+			// fallback to get agent by name
+			r.agent, ok = agent.GetAgentByName(r.Agent)
+			if !ok {
+				return gperr.Errorf("agent %s not found", r.Agent)
+			}
+		}
+	}
+
 	r.Finalize()
+
+	r.started = make(chan struct{})
+	// close the channel when the route is destroyed (if not closed yet).
+	runtime.AddCleanup(r, func(ch chan struct{}) {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}, r.started)
 
 	if r.Idlewatcher != nil && r.Idlewatcher.Proxmox != nil {
 		node := r.Idlewatcher.Proxmox.Node
@@ -155,13 +197,15 @@ func (r *Route) Validate() gperr.Error {
 		r.Idlewatcher = r.Container.IdlewatcherConfig
 	}
 
-	// return error if route is localhost:<godoxy_port>
-	switch r.Host {
-	case "localhost", "127.0.0.1":
-		switch r.Port.Proxy {
-		case common.ProxyHTTPPort, common.ProxyHTTPSPort, common.APIHTTPPort:
-			if r.Scheme.IsReverseProxy() || r.Scheme == route.SchemeTCP {
-				return gperr.Errorf("localhost:%d is reserved for godoxy", r.Port.Proxy)
+	// return error if route is localhost:<godoxy_port> but route is not agent
+	if !r.IsAgent() {
+		switch r.Host {
+		case "localhost", "127.0.0.1":
+			switch r.Port.Proxy {
+			case common.ProxyHTTPPort, common.ProxyHTTPSPort, common.APIHTTPPort:
+				if r.Scheme.IsReverseProxy() || r.Scheme == route.SchemeTCP {
+					return gperr.Errorf("localhost:%d is reserved for godoxy", r.Port.Proxy)
+				}
 			}
 		}
 	}
@@ -173,17 +217,19 @@ func (r *Route) Validate() gperr.Error {
 
 	switch r.Scheme {
 	case route.SchemeFileServer:
-		r.ProxyURL = gperr.Collect(errs, net.ParseURL, "file://"+r.Root)
+		r.ProxyURL = gperr.Collect(errs, nettypes.ParseURL, "file://"+r.Root)
 		r.Host = ""
 		r.Port.Proxy = 0
 	case route.SchemeHTTP, route.SchemeHTTPS:
 		if r.Port.Listening != 0 {
 			errs.Addf("unexpected listening port for %s scheme", r.Scheme)
 		}
-		r.ProxyURL = gperr.Collect(errs, net.ParseURL, fmt.Sprintf("%s://%s:%d", r.Scheme, r.Host, r.Port.Proxy))
+		r.ProxyURL = gperr.Collect(errs, nettypes.ParseURL, fmt.Sprintf("%s://%s:%d", r.Scheme, r.Host, r.Port.Proxy))
 	case route.SchemeTCP, route.SchemeUDP:
-		r.LisURL = gperr.Collect(errs, net.ParseURL, fmt.Sprintf("%s://:%d", r.Scheme, r.Port.Listening))
-		r.ProxyURL = gperr.Collect(errs, net.ParseURL, fmt.Sprintf("%s://%s:%d", r.Scheme, r.Host, r.Port.Proxy))
+		if !r.ShouldExclude() {
+			r.LisURL = gperr.Collect(errs, nettypes.ParseURL, fmt.Sprintf("%s://:%d", r.Scheme, r.Port.Listening))
+		}
+		r.ProxyURL = gperr.Collect(errs, nettypes.ParseURL, fmt.Sprintf("%s://%s:%d", r.Scheme, r.Host, r.Port.Proxy))
 	}
 
 	if !r.UseHealthCheck() && (r.UseLoadBalance() || r.UseIdleWatcher()) {
@@ -212,34 +258,80 @@ func (r *Route) Validate() gperr.Error {
 	}
 
 	r.impl = impl
+	excluded := r.ShouldExclude()
+	r.Excluded = &excluded
 	return nil
 }
 
+func (r *Route) Impl() routes.Route {
+	return r.impl
+}
+
+func (r *Route) Task() *task.Task {
+	return r.task
+}
+
 func (r *Route) Start(parent task.Parent) (err gperr.Error) {
+	r.once.Do(func() {
+		err = r.start(parent)
+	})
+	return
+}
+
+func (r *Route) start(parent task.Parent) gperr.Error {
 	if r.impl == nil { // should not happen
 		return gperr.New("route not initialized")
 	}
+	defer close(r.started)
 
-	return r.impl.Start(parent)
+	if err := r.impl.Start(parent); err != nil {
+		return err
+	}
+
+	if conflict, added := routes.All.AddIfNotExists(r.impl); !added {
+		err := gperr.Errorf("route %s already exists: from %s and %s", r.Alias, r.ProviderName(), conflict.ProviderName())
+		r.task.FinishAndWait(err)
+		return err
+	} else {
+		// reference here because r.impl will be nil after Finish() is called.
+		impl := r.impl
+		r.task.OnCancel("remove_routes_from_all", func() {
+			routes.All.Del(impl)
+		})
+	}
+	return nil
 }
 
 func (r *Route) Finish(reason any) {
+	r.FinishAndWait(reason)
+}
+
+func (r *Route) FinishAndWait(reason any) {
 	if r.impl == nil {
 		return
 	}
-	r.impl.Task().FinishAndWait(reason)
+	r.task.FinishAndWait(reason)
 	r.impl = nil
 }
 
-func (r *Route) Started() bool {
-	return r.impl != nil
+func (r *Route) Started() <-chan struct{} {
+	return r.started
+}
+
+func (r *Route) GetProvider() routes.Provider {
+	return r.provider
+}
+
+func (r *Route) SetProvider(p routes.Provider) {
+	r.provider = p
+	r.Provider = p.ShortName()
 }
 
 func (r *Route) ProviderName() string {
 	return r.Provider
 }
 
-func (r *Route) TargetURL() *net.URL {
+func (r *Route) TargetURL() *nettypes.URL {
 	return r.ProxyURL
 }
 
@@ -260,6 +352,14 @@ func (r *Route) Name() string {
 
 // Key implements pool.Object.
 func (r *Route) Key() string {
+	if r.UseLoadBalance() || r.ShouldExclude() {
+		// for excluded routes and load balanced routes, use provider:alias[-container_id[:8]] as key to make them unique.
+		if r.Container != nil {
+			return r.Provider + ":" + r.Alias + "-" + r.Container.ContainerID[:8]
+		}
+		return r.Provider + ":" + r.Alias
+	}
+	// we need to use alias as key for non-excluded routes because it's being used for subdomain / fqdn lookup for http routes.
 	return r.Alias
 }
 
@@ -273,19 +373,26 @@ func (r *Route) Type() route.RouteType {
 	panic(fmt.Errorf("unexpected scheme %s for alias %s", r.Scheme, r.Alias))
 }
 
-func (r *Route) Agent() *agent.AgentConfig {
-	if r.Container == nil {
-		return nil
+func (r *Route) GetAgent() *agent.AgentConfig {
+	if r.Container != nil && r.Container.Agent != nil {
+		return r.Container.Agent
 	}
-	return r.Container.Agent
+	return r.agent
 }
 
 func (r *Route) IsAgent() bool {
-	return r.Container != nil && r.Container.Agent != nil
+	return r.GetAgent() != nil
 }
 
 func (r *Route) HealthMonitor() health.HealthMonitor {
-	return r.impl.HealthMonitor()
+	return r.HealthMon
+}
+
+func (r *Route) SetHealthMonitor(m health.HealthMonitor) {
+	if r.HealthMon != nil && r.HealthMon != m {
+		r.HealthMon.Finish("health monitor replaced")
+	}
+	r.HealthMon = m
 }
 
 func (r *Route) IdlewatcherConfig() *idlewatcher.Config {
@@ -328,6 +435,12 @@ func (r *Route) IsZeroPort() bool {
 }
 
 func (r *Route) ShouldExclude() bool {
+	if r.lastError != nil {
+		return true
+	}
+	if r.Excluded != nil {
+		return *r.Excluded
+	}
 	if r.Container != nil {
 		switch {
 		case r.Container.IsExcluded:
@@ -342,8 +455,7 @@ func (r *Route) ShouldExclude() bool {
 	} else if r.IsZeroPort() && r.Scheme != route.SchemeFileServer {
 		return true
 	}
-	if strings.HasPrefix(r.Alias, "x-") ||
-		strings.HasSuffix(r.Alias, "-old") {
+	if strings.HasSuffix(r.Alias, "-old") {
 		return true
 	}
 	return false
@@ -358,6 +470,16 @@ func (r *Route) UseIdleWatcher() bool {
 }
 
 func (r *Route) UseHealthCheck() bool {
+	if r.Container != nil {
+		switch {
+		case r.Container.Image.Name == "godoxy-agent":
+			return false
+		case !r.Container.Running && !r.UseIdleWatcher():
+			return false
+		case strings.HasPrefix(r.Container.ContainerName, "buildx_"):
+			return false
+		}
+	}
 	return !r.HealthCheck.Disable
 }
 
@@ -424,7 +546,7 @@ func (r *Route) Finalize() {
 	if isDocker {
 		if r.Scheme == "" {
 			for _, p := range cont.PublicPortMapping {
-				if p.PrivatePort == uint16(pp) && p.Type == "udp" {
+				if int(p.PrivatePort) == pp && p.Type == "udp" {
 					r.Scheme = "udp"
 					break
 				}
@@ -481,6 +603,12 @@ func (r *Route) FinalizeHomepageConfig() {
 		r.Homepage = &homepage.ItemConfig{Show: true}
 	}
 	r.Homepage = r.Homepage.GetOverride(r.Alias)
+
+	if r.ShouldExclude() && isDocker {
+		r.Homepage.Show = false
+		r.Homepage.Name = r.Container.ContainerName // still show container name in metrics page
+		return
+	}
 
 	hp := r.Homepage
 	refs := r.References()
