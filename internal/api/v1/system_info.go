@@ -4,16 +4,15 @@ import (
 	"net/http"
 
 	agentPkg "github.com/yusing/go-proxy/agent/pkg/agent"
-	config "github.com/yusing/go-proxy/internal/config/types"
 	"github.com/yusing/go-proxy/internal/gperr"
 	"github.com/yusing/go-proxy/internal/metrics/systeminfo"
 	"github.com/yusing/go-proxy/internal/net/gphttp"
 	"github.com/yusing/go-proxy/internal/net/gphttp/httpheaders"
 	"github.com/yusing/go-proxy/internal/net/gphttp/reverseproxy"
-	"github.com/yusing/go-proxy/internal/net/types"
+	nettypes "github.com/yusing/go-proxy/internal/net/types"
 )
 
-func SystemInfo(cfg config.ConfigInstance, w http.ResponseWriter, r *http.Request) {
+func SystemInfo(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	agentAddr := query.Get("agent_addr")
 	query.Del("agent_addr")
@@ -22,7 +21,7 @@ func SystemInfo(cfg config.ConfigInstance, w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	agent, ok := cfg.GetAgent(agentAddr)
+	agent, ok := agentPkg.GetAgent(agentAddr)
 	if !ok {
 		gphttp.NotFound(w, "agent_addr")
 		return
@@ -41,7 +40,7 @@ func SystemInfo(cfg config.ConfigInstance, w http.ResponseWriter, r *http.Reques
 		}
 		gphttp.WriteBody(w, respData)
 	} else {
-		rp := reverseproxy.NewReverseProxy("agent", types.NewURL(agentPkg.AgentURL), agent.Transport())
+		rp := reverseproxy.NewReverseProxy("agent", nettypes.NewURL(agentPkg.AgentURL), agent.Transport())
 		header := r.Header.Clone()
 		r, err := http.NewRequestWithContext(r.Context(), r.Method, agentPkg.EndpointSystemInfo+"?"+query.Encode(), nil)
 		if err != nil {

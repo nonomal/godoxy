@@ -5,13 +5,14 @@ import (
 	_ "embed"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 
 	"github.com/yusing/go-proxy/internal/common"
 	"github.com/yusing/go-proxy/internal/gperr"
 	"github.com/yusing/go-proxy/internal/net/gphttp/reverseproxy"
-	"github.com/yusing/go-proxy/internal/net/types"
+	nettypes "github.com/yusing/go-proxy/internal/net/types"
 	. "github.com/yusing/go-proxy/internal/utils/testing"
 )
 
@@ -62,11 +63,10 @@ func (rt *requestRecorder) RoundTrip(req *http.Request) (resp *http.Response, er
 			TLS:           req.TLS,
 		}
 	}
-	if err == nil {
-		for k, v := range rt.args.respHeaders {
-			resp.Header[k] = v
-		}
+	if err != nil {
+		return nil, err
 	}
+	maps.Copy(resp.Header, rt.args.respHeaders)
 	return resp, nil
 }
 
@@ -80,11 +80,11 @@ type TestResult struct {
 
 type testArgs struct {
 	middlewareOpt OptionsRaw
-	upstreamURL   *types.URL
+	upstreamURL   *nettypes.URL
 
 	realRoundTrip bool
 
-	reqURL    *types.URL
+	reqURL    *nettypes.URL
 	reqMethod string
 	headers   http.Header
 	body      []byte
@@ -96,13 +96,13 @@ type testArgs struct {
 
 func (args *testArgs) setDefaults() {
 	if args.reqURL == nil {
-		args.reqURL = Must(types.ParseURL("https://example.com"))
+		args.reqURL = Must(nettypes.ParseURL("https://example.com"))
 	}
 	if args.reqMethod == "" {
 		args.reqMethod = http.MethodGet
 	}
 	if args.upstreamURL == nil {
-		args.upstreamURL = Must(types.ParseURL("https://10.0.0.1:8443")) // dummy url, no actual effect
+		args.upstreamURL = Must(nettypes.ParseURL("https://10.0.0.1:8443")) // dummy url, no actual effect
 	}
 	if args.respHeaders == nil {
 		args.respHeaders = http.Header{}
@@ -143,9 +143,7 @@ func newMiddlewaresTest(middlewares []*Middleware, args *testArgs) (*TestResult,
 	args.setDefaults()
 
 	req := httptest.NewRequest(args.reqMethod, args.reqURL.String(), args.bodyReader())
-	for k, v := range args.headers {
-		req.Header[k] = v
-	}
+	maps.Copy(req.Header, args.headers)
 
 	w := httptest.NewRecorder()
 

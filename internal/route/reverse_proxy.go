@@ -3,6 +3,7 @@ package route
 import (
 	"crypto/tls"
 	"net/http"
+	"sync"
 
 	"github.com/yusing/go-proxy/agent/pkg/agent"
 	"github.com/yusing/go-proxy/agent/pkg/agentproxy"
@@ -15,23 +16,18 @@ import (
 	loadbalance "github.com/yusing/go-proxy/internal/net/gphttp/loadbalancer/types"
 	"github.com/yusing/go-proxy/internal/net/gphttp/middleware"
 	"github.com/yusing/go-proxy/internal/net/gphttp/reverseproxy"
-	"github.com/yusing/go-proxy/internal/net/types"
+	nettypes "github.com/yusing/go-proxy/internal/net/types"
 	"github.com/yusing/go-proxy/internal/route/routes"
 	"github.com/yusing/go-proxy/internal/task"
-	"github.com/yusing/go-proxy/internal/watcher/health"
 	"github.com/yusing/go-proxy/internal/watcher/health/monitor"
 )
 
 type ReveseProxyRoute struct {
 	*Route
 
-	HealthMon health.HealthMonitor `json:"health,omitempty"`
-
 	loadBalancer *loadbalancer.LoadBalancer
 	handler      http.Handler
 	rp           *reverseproxy.ReverseProxy
-
-	task *task.Task
 }
 
 var _ routes.ReverseProxyRoute = (*ReveseProxyRoute)(nil)
@@ -43,14 +39,14 @@ func NewReverseProxyRoute(base *Route) (*ReveseProxyRoute, gperr.Error) {
 	proxyURL := base.ProxyURL
 
 	var trans *http.Transport
-	a := base.Agent()
+	a := base.GetAgent()
 	if a != nil {
 		trans = a.Transport()
-		proxyURL = types.NewURL(agent.HTTPProxyURL)
+		proxyURL = nettypes.NewURL(agent.HTTPProxyURL)
 	} else {
 		trans = gphttp.NewTransport()
 		if httpConfig.NoTLSVerify {
-			trans.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+			trans.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 		}
 		if httpConfig.ResponseHeaderTimeout > 0 {
 			trans.ResponseHeaderTimeout = httpConfig.ResponseHeaderTimeout
@@ -98,14 +94,11 @@ func (r *ReveseProxyRoute) ReverseProxy() *reverseproxy.ReverseProxy {
 
 // Start implements task.TaskStarter.
 func (r *ReveseProxyRoute) Start(parent task.Parent) gperr.Error {
-	if existing, ok := routes.HTTP.Get(r.Key()); ok && !r.UseLoadBalance() {
-		return gperr.Errorf("route already exists: from provider %s and %s", existing.ProviderName(), r.ProviderName())
-	}
 	r.task = parent.Subtask("http."+r.Name(), false)
 
 	switch {
 	case r.UseIdleWatcher():
-		waker, err := idlewatcher.NewWatcher(parent, r)
+		waker, err := idlewatcher.NewWatcher(parent, r, r.IdlewatcherConfig())
 		if err != nil {
 			r.task.Finish(err)
 			return gperr.Wrap(err)
@@ -139,11 +132,19 @@ func (r *ReveseProxyRoute) Start(parent task.Parent) gperr.Error {
 		}
 	}
 
+	if r.ShouldExclude() {
+		return nil
+	}
+
+	if err := checkExists(r); err != nil {
+		return err
+	}
+
 	if r.UseLoadBalance() {
 		r.addToLoadBalancer(parent)
 	} else {
 		routes.HTTP.Add(r)
-		r.task.OnFinished("entrypoint_remove_route", func() {
+		r.task.OnCancel("remove_route_from_http", func() {
 			routes.HTTP.Del(r)
 		})
 	}
@@ -152,30 +153,21 @@ func (r *ReveseProxyRoute) Start(parent task.Parent) gperr.Error {
 	return nil
 }
 
-// Task implements task.TaskStarter.
-func (r *ReveseProxyRoute) Task() *task.Task {
-	return r.task
-}
-
-// Finish implements task.TaskFinisher.
-func (r *ReveseProxyRoute) Finish(reason any) {
-	r.task.Finish(reason)
-}
-
 func (r *ReveseProxyRoute) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.handler.ServeHTTP(w, req)
 }
 
-func (r *ReveseProxyRoute) HealthMonitor() health.HealthMonitor {
-	return r.HealthMon
-}
+var lbLock sync.Mutex
 
 func (r *ReveseProxyRoute) addToLoadBalancer(parent task.Parent) {
 	var lb *loadbalancer.LoadBalancer
 	cfg := r.LoadBalance
+	lbLock.Lock()
+
 	l, ok := routes.HTTP.Get(cfg.Link)
 	var linked *ReveseProxyRoute
 	if ok {
+		lbLock.Unlock()
 		linked = l.(*ReveseProxyRoute)
 		lb = linked.loadBalancer
 		lb.UpdateConfigIfNeeded(cfg)
@@ -187,17 +179,20 @@ func (r *ReveseProxyRoute) addToLoadBalancer(parent task.Parent) {
 		_ = lb.Start(parent) // always return nil
 		linked = &ReveseProxyRoute{
 			Route: &Route{
-				Alias:    cfg.Link,
-				Homepage: r.Homepage,
+				Alias:     cfg.Link,
+				Homepage:  r.Homepage,
+				HealthMon: lb,
 			},
-			HealthMon:    lb,
 			loadBalancer: lb,
 			handler:      lb,
 		}
-		routes.HTTP.Add(linked)
-		r.task.OnFinished("entrypoint_remove_route", func() {
-			routes.HTTP.Del(linked)
+		routes.HTTP.AddKey(cfg.Link, linked)
+		routes.All.AddKey(cfg.Link, linked)
+		r.task.OnFinished("remove_loadbalancer_route", func() {
+			routes.HTTP.DelKey(cfg.Link)
+			routes.All.DelKey(cfg.Link)
 		})
+		lbLock.Unlock()
 	}
 	r.loadBalancer = lb
 

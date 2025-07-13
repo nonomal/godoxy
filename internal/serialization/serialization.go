@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"reflect"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -153,20 +152,17 @@ func dive(dst reflect.Value) (v reflect.Value, t reflect.Type, err gperr.Error) 
 			}
 			dst = dst.Elem()
 			dstT = dst.Type()
-		case reflect.Struct:
+		case reflect.Map:
+			if dst.IsNil() {
+				dst.Set(reflect.MakeMap(dstT))
+			}
+			return dst, dstT, nil
+		case reflect.Slice:
+			if dst.IsNil() {
+				dst.Set(reflect.MakeSlice(dstT, 0, 0))
+			}
 			return dst, dstT, nil
 		default:
-			if dst.IsNil() {
-				switch dst.Kind() {
-				case reflect.Map:
-					dst.Set(reflect.MakeMap(dstT))
-				case reflect.Slice:
-					dst.Set(reflect.MakeSlice(dstT, 0, 0))
-				default:
-					err = gperr.Errorf("deserialize: %w for dst %s", ErrInvalidType, dstT.String())
-					return
-				}
-			}
 			return dst, dstT, nil
 		}
 	}
@@ -198,7 +194,7 @@ func mapUnmarshalValidate(src SerializedObject, dst any, checkValidateTag bool) 
 			dstV.Set(reflect.Zero(dstT))
 			return nil
 		}
-		return gperr.Errorf("deserialize: src is %w and dst is not settable\n%s", ErrNilValue, debug.Stack())
+		return gperr.Errorf("deserialize: src is %w and dst is not settable", ErrNilValue)
 	}
 
 	if dstT.Implements(mapUnmarshalerType) {
@@ -525,6 +521,17 @@ func UnmarshalValidateYAML[T any](data []byte, target *T) gperr.Error {
 	m := make(map[string]any)
 	if err := yaml.Unmarshal(data, &m); err != nil {
 		return gperr.Wrap(err)
+	}
+	return MapUnmarshalValidate(m, target)
+}
+
+func UnmarshalValidateYAMLIntercept[T any](data []byte, target *T, intercept func(m map[string]any) gperr.Error) gperr.Error {
+	m := make(map[string]any)
+	if err := yaml.Unmarshal(data, &m); err != nil {
+		return gperr.Wrap(err)
+	}
+	if err := intercept(m); err != nil {
+		return err
 	}
 	return MapUnmarshalValidate(m, target)
 }
